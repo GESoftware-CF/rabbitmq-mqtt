@@ -17,6 +17,8 @@
 -module(rabbit_mqtt_reader).
 -behaviour(gen_server2).
 
+-include_lib("public_key/include/public_key.hrl").
+
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          code_change/3, terminate/2]).
@@ -52,7 +54,7 @@ handle_cast({go, Sock0, SockTransform, KeepaliveSup}, undefined) ->
                 {ok, Sock} ->
                     rabbit_alarm:register(
                       self(), {?MODULE, conserve_resources, []}),
-                    ProcessorState = rabbit_mqtt_processor:initial_state(Sock,ssl_login_name(Sock)),
+                    ProcessorState = rabbit_mqtt_processor:initial_state(Sock,ssl_login_name_predix(Sock)),
                     {noreply,
                      control_throttle(
                        #state{socket           = Sock,
@@ -203,6 +205,66 @@ ssl_login_name(Sock) ->
       nossl                -> none
   end.
 
+%% CN is deviceid  and UID(User ID) is tenantid in certificate.
+
+%% return true if the issuer contains predix in it
+isPredix(Cert) ->
+  Issuer = rabbit_ssl:peer_cert_issuer(Cert),
+  Subject = rabbit_ssl:peer_cert_subject(Cert),
+  %% log(info, "\nissuer=~p sub=~p \n", [Issuer,Subject]),
+  %% uncomment line below and comment 'true' to enable the check that cert is issued by Predix
+  %% string:str(Issuer,"Predix Secure Device") > 0.
+  true.
+
+%% extract tenant info from UserID field
+getPredixTenant(Cert) ->
+  F1 = rabbit_ssl:peer_cert_subject_items(Cert, {0,9,2342,19200300,100,1,1}),
+  F1.
+
+%% get the device information from Common Name
+getPredixDevice(Cert)->
+  F5 = rabbit_ssl:peer_cert_subject_items(Cert, ?'id-at-commonName'),
+  F5.
+
+%% get the entire username=tenant:device string from the cert
+getPredixUsername(Cert) ->
+  TenantName = getPredixTenant(Cert),
+  DeviceName = getPredixDevice(Cert),
+  %% log(info, "\nMQTT devicename=~p tenant-d=~p\n", [DeviceName, TenantName]),
+  %% H1 = head(TenantName),
+  [H2|_] = DeviceName,
+  case TenantName of
+    not_found -> Username = list_to_binary(DeviceName);
+    UIDs ->
+      [H1|_] = UIDs,
+      Username = list_to_binary(H1 ++ ":" ++ H2)
+  end,
+  %% log(info, "\nMQTT username=~p\n", [Username]),
+  Username.
+
+
+getPredixName(Name, IsPredix, Cert) ->
+        %% log(info,"\nisPredix=~p   PredixTenant=~p PredixDevice=~p\n", [IsPredix, getPredixTenant(Cert), getPredixDevice(Cert)]),
+        case IsPredix of
+                true ->
+                        PredixUserName = getPredixUsername(Cert),
+                        log(info,"\n\niPredix=~p   PredixUserName=~p\n\n", [IsPredix,PredixUserName]),
+                        PredixUserName;
+                false -> Name
+        end.
+
+
+ssl_login_name_predix(Sock) ->
+  case rabbit_net:peercert(Sock) of
+      {ok, C}              ->   IsPredix = isPredix(C),
+                                case rabbit_ssl:peer_cert_auth_name(C) of
+                                    unsafe    -> none;
+                                    not_found -> none;
+                                    Name      -> getPredixName(Name, IsPredix, C)
+                                end;
+      {error, no_peercert} -> none;
+      nossl                -> none
+  end.
 %%----------------------------------------------------------------------------
 
 process_received_bytes(<<>>, State) ->
